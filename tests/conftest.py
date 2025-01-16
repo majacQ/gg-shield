@@ -1,406 +1,246 @@
+import json
 import os
-from os.path import dirname, join, realpath
+import platform
+from pathlib import Path
+from typing import Any, Dict
 
 import pytest
-import vcr
-from click.testing import CliRunner
-from pygitguardian import GGClient
-from pygitguardian.models import ScanResult
-
-from ggshield.config import Cache
 
 
-_MULTIPLE_SECRETS_PATCH = """@@ -0,0 +1,2 @@
-+FacebookAppKeys :
-+String docker run --name geonetwork -d \
-            -p 8080:8080 -e MYSQL_HOST=google.com \
-            -e MYSQL_PORT=5434 -e MYSQL_USERNAME=root \
-            -e MYSQL_PASSWORD=m42ploz2wd geonetwork
-"""
+# The directory holding ggshield repository checkout
+ROOT_DIR = Path(__file__).parent.parent
 
-_MULTIPLE_SECRETS = (
-    """diff --git a/test.txt b/test.txt
-new file mode 100644
-index 0000000..b80e3df
---- /dev/null
-+++ b/test
-"""
-    + _MULTIPLE_SECRETS_PATCH
+JSON_SCHEMAS_DIR = ROOT_DIR / "doc/schemas"
+
+# This is a test token, it is always reported as a valid secret
+# Use your own value if needed
+GG_VALID_TOKEN = os.getenv("TEST_GG_VALID_TOKEN", "ggtt-v-12345azert")  # ggignore
+GG_VALID_TOKEN_IGNORE_SHA = os.getenv(
+    "TEST_GG_VALID_TOKEN_IGNORE_SHA",
+    "56c126cef75e3d17c3de32dac60bab688ecc384a054c2c85b688c1dd7ac4eefd",
 )
 
-_MULTIPLE_SECRETS_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policy_break_count": 1,
-        "policies": ["Secrets detection", "File extensions", "Filenames"],
-        "policy_breaks": [
+# This secret must be a secret known by the dashboard running functional tests
+KNOWN_SECRET = os.environ.get("TEST_KNOWN_SECRET", "")
+
+# This secret must not be known by the dashboard running our tests
+UNKNOWN_SECRET = os.environ.get("TEST_UNKNOWN_SECRET", "ggtt-v-0d4buhg879")  # ggignore
+
+
+def is_windows():
+    return platform.system() == "Windows"
+
+
+skipwindows = pytest.mark.skipif(
+    is_windows() and not os.environ.get("DISABLE_SKIPWINDOWS"),
+    reason="Skipped on Windows for now, define DISABLE_SKIPWINDOWS environment variable to unskip",
+)
+
+
+@pytest.fixture(autouse=True)
+def do_not_use_real_user_dirs(monkeypatch, tmp_path):
+    """
+    This fixture ensures we do not use real user directories.
+    Overridden directories are:
+    - the auth configuration directory, where `ggshield auth` stores credentials.
+    - the cache directory
+    - the home directory
+    """
+    monkeypatch.setenv("GG_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("GG_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("GG_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("GG_USER_HOME_DIR", str(tmp_path / "home"))
+
+
+@pytest.fixture(autouse=True)
+def do_not_use_colors(monkeypatch):
+    """
+    This fixture ensures we do not print colors for easier testing.
+    """
+    monkeypatch.setenv("NO_COLOR", "1")
+
+
+PIPFILE_WITH_VULN = """
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+sqlparse = "==0.4.4"
+
+[dev-packages]
+
+[requires]
+python_version = "3.10"
+"""
+
+PIPFILE_LOCK_WITH_VULN = """
+{
+    "_meta": {
+        "hash": {
+            "sha256": "2bf167f6a72aaa0f48f5876945f2a37874f3f114dad5e952cd7df9dfe8d9d281"
+        },
+        "pipfile-spec": 6,
+        "requires": {
+            "python_version": "3.10"
+        },
+        "sources": [
             {
-                "type": "MySQL Assignment",
-                "policy": "Secrets detection",
-                "matches": [
-                    {
-                        "type": "host",
-                        "match": "google.com",
-                        "index_start": 114,
-                        "index_end": 123,
-                        "line_start": 3,
-                        "line_end": 3,
-                    },
-                    {
-                        "type": "port",
-                        "match": "5434",
-                        "index_start": 151,
-                        "index_end": 154,
-                        "line_start": 3,
-                        "line_end": 3,
-                    },
-                    {
-                        "type": "username",
-                        "match": "root",
-                        "index_start": 174,
-                        "index_end": 177,
-                        "line_start": 3,
-                        "line_end": 3,
-                    },
-                    {
-                        "type": "password",
-                        "match": "m42ploz2wd",
-                        "index_start": 209,
-                        "index_end": 218,
-                        "line_start": 3,
-                        "line_end": 3,
-                    },
-                ],
+                "name": "pypi",
+                "url": "https://pypi.org/simple",
+                "verify_ssl": true
             }
-        ],
-    }
-)
-
-
-_SIMPLE_SECRET = (
-    "diff --git a/test.txt b/test.txt\n"
-    "new file mode 100644\n"
-    "index 0000000..b80e3df\n"
-    "--- /dev/null\n"
-    "+++ b/test\n"
-    "@@ -0,0 +2 @@\n"
-    "+Sendgrid:\n"
-    '+sg_key = "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";\n'  # noqa
-)
-
-_SIMPLE_SECRET_PATCH = """@@ -0,0 +1 @@
-+github_token: 368ac3edf9e850d1c0ff9d6c526496f8237ddf91
-"""
-_SIMPLE_SECRET_PATCH_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policies": ["File extensions", "Filenames", "Secrets detection"],
-        "policy_breaks": [
-            {
-                "type": "GitHub Token",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": "368ac3edf9e850d1c0ff9d6c526496f8237ddf91",  # noqa
-                        "type": "apikey",
-                        "index_start": 29,
-                        "index_end": 69,
-                    }
-                ],
-            }
-        ],
-        "policy_break_count": 1,
-    }
-)
-
-_SIMPLE_SECRET_WITH_FILENAME_PATCH_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policies": ["File extensions", "Filenames", "Secrets detection"],
-        "policy_breaks": [
-            {
-                "type": ".env",
-                "policy": "Filenames",
-                "matches": [{"type": "filename", "match": ".env"}],
-            },
-            {
-                "type": "GitHub Token",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": "368ac3edf9e850d1c0ff9d6c526496f8237ddf91",  # noqa
-                        "type": "apikey",
-                        "index_start": 29,
-                        "index_end": 69,
-                    }
-                ],
-            },
-        ],
-        "policy_break_count": 2,
-    }
-)
-
-_MULTI_SECRET_ONE_LINE_PATCH = """@@ -0,0 +1 @@
-+FacebookAppId = 294790898041575; FacebookAppSecret = ce3f9f0362bbe5ab01dfc8ee565e4372;
-
+        ]
+    },
+    "default": {
+        "sqlparse": {
+            "hashes": [
+                "sha256:0323c0ec29cd52bceabc1b4d9d579e311f3e4961b98d174201d5622a23b85e34",
+                "sha256:69ca804846bb114d2ec380e4360a8a340db83f0ccf3afceeb1404df028f57268"
+            ],
+            "index": "pypi",
+            "version": "==0.4.4"
+        }
+    },
+    "develop": {}
+}
 """
 
-_MULTI_SECRET_ONE_LINE_PATCH_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policies": ["File extensions", "Filenames", "Secrets detection"],
-        "policy_breaks": [
+PIPFILE_LOCK_WITH_VULN_NO_FIX = """
+{
+    "_meta": {
+        "hash": {
+            "sha256": "2bf167f6a72aaa0f48f5876945f2a37874f3f114dad5e952cd7df9dfe8d9d281"
+        },
+        "pipfile-spec": 6,
+        "requires": {
+            "python_version": "3.10"
+        },
+        "sources": [
             {
-                "type": "Facebook Access Tokens",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": "294790898041575",
-                        "index_start": 31,
-                        "index_end": 46,
-                        "type": "client_id",
-                    },
-                    {
-                        "match": "ce3f9f0362bbe5ab01dfc8ee565e4372",
-                        "index_start": 68,
-                        "index_end": 100,
-                        "type": "client_secret",
-                    },
-                ],
+                "name": "pypi",
+                "url": "https://pypi.org/simple",
+                "verify_ssl": true
             }
-        ],
-        "policy_break_count": 1,
-    }
-)
-
-
-_MULTI_SECRET_ONE_LINE_PATCH_OVERLAY = """@@ -0,0 +1 @@
-+Facebook = 294790898041575 | ce3f9f0362bbe5ab01dfc8ee565e4372;
-
+        ]
+    },
+    "default": {
+        "h2o": {
+            "hashes": [],
+            "index": "pypi",
+            "version": "==3.18.0.8"
+        }
+    },
+    "develop": {}
+}
 """
 
-_MULTI_SECRET_ONE_LINE_PATCH_OVERLAY_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policies": ["File extensions", "Filenames", "Secrets detection"],
-        "policy_breaks": [
-            {
-                "type": "Facebook Access Tokens",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": "294790898041575",
-                        "index_start": 26,
-                        "index_end": 41,
-                        "type": "client_id",
-                    },
-                    {
-                        "match": "ce3f9f0362bbe5ab01dfc8ee565e4372",
-                        "index_start": 44,
-                        "index_end": 76,
-                        "type": "client_secret",
-                    },
-                ],
-            }
-        ],
-        "policy_break_count": 1,
-    }
-)
+PIPFILE_NO_VULN = """
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
 
-_MULTI_SECRET_TWO_LINES_PATCH = """@@ -0,0 +2 @@
-+FacebookAppId = 294790898041575;
-+FacebookAppSecret = ce3f9f0362bbe5ab01dfc8ee565e4372;
+[packages]
+sqlparse = "==0.5.0"
 
+[dev-packages]
+
+[requires]
+python_version = "3.10"
 """
 
-_MULTI_SECRET_TWO_LINES_PATCH_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policies": ["File extensions", "Filenames", "Secrets detection"],
-        "policy_breaks": [
+PIPFILE_LOCK_NO_VULN = """
+{
+    "_meta": {
+        "hash": {
+            "sha256": "9e0257467cb126854e4a922f143941c3ffd38bca1c5805c778f96af3832f9fd3"
+        },
+        "pipfile-spec": 6,
+        "requires": {
+            "python_version": "3.10"
+        },
+        "sources": [
             {
-                "type": "Facebook Access Tokens",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": "294790898041575",
-                        "index_start": 31,
-                        "index_end": 46,
-                        "type": "client_id",
-                    },
-                    {
-                        "match": "ce3f9f0362bbe5ab01dfc8ee565e4372",
-                        "index_start": 69,
-                        "index_end": 101,
-                        "type": "client_secret",
-                    },
-                ],
+                "name": "pypi",
+                "url": "https://pypi.org/simple",
+                "verify_ssl": true
             }
-        ],
-        "policy_break_count": 1,
-    }
-)
-
-_MULTILINE_SECRET = """-----BEGIN RSA PRIVATE KEY-----
-+MIIBOgIBAAJBAIIRkYjxjE3KIZiEc8k4sWWGNsPYRNE0u0bl5oFVApPLm+uXQ/4l
-+bKO9LFtMiVPy700oMWLScwAN5OAiqVLMvHUCAwEAAQJANLr8nmEWuV6t2hAwhK5I
-+NNmBkEo4M/xFxEtl9J7LKbE2gtNrlCQiJlPP1EMhwAjDOzQcJ3lgFB28dkqH5rMW
-+TQIhANrCE7O+wlCKe0WJqQ3lYlHG91XWyGVgfExJwBDsAD9LAiEAmDY5OSsH0n2A
-+22tthkAvcN1s66lG+0DztOVJ4QLI2z8CIBPeDGwGpx8pdIicN/5LFuLWbyAcoZaT
-+bLaA/DCNPniBAiA0l//bzg+M3srIhm04xzLdR9Vb9IjPRlkvN074zdKDVwIhAKJb
-+RF3C+CMFb0wXme/ovcDeM1+3W/UmSHYUW4b3WYq4
-+-----END RSA PRIVATE KEY-----"""
-
-_SIMPLE_SECRET_MULTILINE_PATCH_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policies": ["File extensions", "Filenames", "Secrets detection"],
-        "policy_breaks": [
-            {
-                "type": "RSA Private Key",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": _MULTILINE_SECRET,  # noqa
-                        "index_start": 42,
-                        "index_end": 543,
-                        "type": "apikey",
-                    }
-                ],
-            }
-        ],
-        "policy_break_count": 1,
-    }
-)
-
-_SIMPLE_SECRET_MULTILINE_PATCH = (
-    """@@ -0,0 +1,29 @@
-+PrivateKeyRsa:
-+- text: """
-    + _MULTILINE_SECRET
-)
-
-
-_ONE_LINE_AND_MULTILINE_PATCH_SCAN_RESULT = ScanResult.SCHEMA.load(
-    {
-        "policy_breaks": [
-            {
-                "type": "Facebook Access Tokens",
-                "policy": "Secrets Detection",
-                "matches": [
-                    {
-                        "match": "294790898041573",
-                        "line_start": 2,
-                        "line_end": 2,
-                        "index_start": 34,
-                        "index_end": 49,
-                        "type": "client_id",
-                    },
-                    {
-                        "match": "ce3f9f0362bbe5ab01dfc8ee565e4371",
-                        "line_start": 2,
-                        "line_end": 2,
-                        "index_start": 52,
-                        "index_end": 84,
-                        "type": "client_secret",
-                    },
-                ],
-            },
-            {
-                "type": "RSA Private Key",
-                "policy": "Secrets detection",
-                "matches": [
-                    {
-                        "line_start": 2,
-                        "match": _MULTILINE_SECRET,
-                        "index_start": 86,
-                        "index_end": 585,
-                        "type": "apikey",
-                        "line_end": 10,
-                    }
-                ],
-            },
-            {
-                "type": "SendGrid Key",
-                "policy": "Secrets detection",
-                "matches": [
-                    {
-                        "line_start": 10,
-                        "match": "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",  # noqa
-                        "index_start": 594,
-                        "index_end": 662,
-                        "type": "apikey",
-                        "line_end": 10,
-                    }
-                ],
-            },
-        ],
-        "policies": ["Filenames", "File extensions", "Secrets detection"],
-        "policy_break_count": 2,
-    }
-)
-
-_ONE_LINE_AND_MULTILINE_PATCH_CONTENT = """@@ -0,0 +1,29 @@
-+FacebookAppKeys: 294790898041573 / ce3f9f0362bbe5ab01dfc8ee565e4371 -----BEGIN RSA PRIVATE KEY-----
-+MIIBOgIBAAJBAIIRkYjxjE3KIZiEc8k4sWWGNsPYRNE0u0bl5oFVApPLm+uXQ/4l
-+bKO9LFtMiVPy700oMWLScwAN5OAiqVLMvHUCAwEAAQJANLr8nmEWuV6t2hAwhK5I
-+NNmBkEo4M/xFxEtl9J7LKbE2gtNrlCQiJlPP1EMhwAjDOzQcJ3lgFB28dkqH5rMW
-+TQIhANrCE7O+wlCKe0WJqQ3lYlHG91XWyGVgfExJwBDsAD9LAiEAmDY5OSsH0n2A
-+22tthkAvcN1s66lG+0DztOVJ4QLI2z8CIBPeDGwGpx8pdIicN/5LFuLWbyAcoZaT
-+bLaA/DCNPniBAiA0l//bzg+M3srIhm04xzLdR9Vb9IjPRlkvN074zdKDVwIhAKJb
-+RF3C+CMFb0wXme/ovcDeM1+3W/UmSHYUW4b3WYq4
-+-----END RSA PRIVATE KEY----- token: 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
-"""  # noqa
-
-_ONE_LINE_AND_MULTILINE_PATCH = (
-    """diff --git a/test.txt b/test.txt
-new file mode 100644
-index 0000000..b80e3df
---- /dev/null
-+++ b/test
+        ]
+    },
+    "default": {
+        "sqlparse": {
+            "hashes": [
+                "sha256:5430a4fe2ac7d0f93e66f1efc6e1338a41884b7ddf2a350cedd20ccc4d9d28f3",
+                "sha256:d446183e84b8349fa3061f0fe7f06ca94ba65b426946ffebe6e3e8295332420c"
+            ],
+            "index": "pypi",
+            "version": "==0.5.0"
+        }
+    },
+    "develop": {}
+}
 """
-    + _ONE_LINE_AND_MULTILINE_PATCH_CONTENT
-)
 
-_NO_SECRET = (
-    "diff --git a/test.txt b/test.txt\n"
-    "new file mode 100644\n"
-    "index 0000000..b80e3df\n"
-    "--- /dev/null\n"
-    "+++ b/test\n"
-    "@@ -0,0 +1 @@\n"
-    "+this is a patch without secret\n"
-)
 
-my_vcr = vcr.VCR(
-    cassette_library_dir=join(dirname(realpath(__file__)), "cassettes"),
-    path_transformer=vcr.VCR.ensure_suffix(".yaml"),
-    decode_compressed_response=True,
-    ignore_localhost=True,
-    match_on=["method", "url"],
-    serializer="yaml",
-    record_mode="once",
-    filter_headers=["Authorization"],
-)
+@pytest.fixture
+def pipfile_lock_with_vuln() -> str:
+    return PIPFILE_LOCK_WITH_VULN
+
+
+def clean_directory(path: Path):
+    for filepath in path.iterdir():
+        if filepath.is_file():
+            os.remove(filepath)
 
 
 @pytest.fixture(scope="session")
-def client() -> GGClient:
-    api_key = os.getenv("TEST_GITGUARDIAN_API_KEY", "1234567890")
-    base_uri = os.getenv("TEST_GITGUARDIAN_API_URL", "https://api.gitguardian.com")
-    return GGClient(api_key, base_uri)
+def secret_json_schema() -> Dict[str, Any]:
+    """Load the JSON schema for all `secret scan` commands,"""
+    return _load_json_schema("secret.json")
 
 
 @pytest.fixture(scope="session")
-def cache() -> Cache:
-    c = Cache()
-    c.purge()
-    return c
+def quota_json_schema() -> Dict[str, Any]:
+    """Load the JSON schema for `quota` command."""
+    return _load_json_schema("quota.json")
 
 
 @pytest.fixture(scope="session")
-def cli_runner():
-    os.environ["GITGUARDIAN_API_KEY"] = os.getenv(
-        "TEST_GITGUARDIAN_API_KEY", "1234567890"
-    )
-    os.environ["GITGUARDIAN_API_URL"] = "https://api.gitguardian.com/"
-    return CliRunner()
+def api_status_json_schema() -> Dict[str, Any]:
+    """Load the JSON schema for `api-status` command."""
+    return _load_json_schema("api-status.json")
 
 
-@pytest.fixture(scope="class")
-def cli_fs_runner(cli_runner):
-    with cli_runner.isolated_filesystem():
-        yield cli_runner
+@pytest.fixture(scope="session")
+def config_list_json_schema() -> Dict[str, Any]:
+    """Load the JSON schema for `config list` command."""
+    return _load_json_schema("config_list.json")
+
+
+def _load_json_schema(name: str) -> Dict[str, Any]:
+    """Load a JSON schema and patch it to reject additional properties. We patch it this
+    way to ensure all fields of ggshield JSON output are documented in the JSON schema.
+    """
+    with (JSON_SCHEMAS_DIR / name).open() as fp:
+        dct = json.load(fp)
+    _reject_additional_properties(dct)
+    return dct
+
+
+def _reject_additional_properties(dct: Dict[str, Any]):
+    """Helper for JSON Schema fixtures: adds `"additionalProperties": false` to all
+    objects of the JSON schema, ensuring we do not add fields without updating the
+    schema.
+    """
+    try:
+        type_ = dct["type"]
+    except KeyError:
+        return
+    if type_ == "object":
+        dct["additionalProperties"] = False
+        for child in dct["properties"].values():
+            _reject_additional_properties(child)
+    elif type_ == "array":
+        _reject_additional_properties(dct["items"])

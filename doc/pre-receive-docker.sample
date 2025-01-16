@@ -1,0 +1,22 @@
+#!/bin/sh
+# ggshield as a pre-commit hook
+# Move `pre-receive-docker.sample` to `.git/hooks/pre-receive`
+# Do not forget to `chmod +x .git/hooks/pre-receive`
+# either set an environment variable machine wide `GITGUARDIAN_API_KEY`
+# or uncomment and insert your key in the following line
+# if you use more than 2 push options, be sure to export them to the container
+
+#export GITGUARDIAN_API_KEY=<INSERT YOUR KEY>
+
+set -x
+docker run -i --rm \
+    -v $PWD:$PWD \
+    -w $PWD \
+    -e GITGUARDIAN_API_KEY \
+    -e GIT_PUSH_OPTION_COUNT \
+    -e GIT_PUSH_OPTION_0 \
+    -e GIT_PUSH_OPTION_1 \
+    -e GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    -e GIT_OBJECT_DIRECTORY \
+    -e GIT_QUARANTINE_PATH \
+    gitguardian/ggshield:latest ggshield secret scan pre-receive

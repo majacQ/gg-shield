@@ -1,7 +1,9 @@
-*
+**
 .*
-!Pipfile*
+
+!pdm.lock
 !ggshield
 !README.md
 !LICENSE
-!setup*
+!pyproject.toml
+!docker

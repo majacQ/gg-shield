@@ -1,0 +1,46 @@
+interactions:
+  - request:
+      body: '{"hashes": ["743d9fde380b7064cc6a8d3071184fc47905cf7440e5615cd46c7b6cbfb46d47"]}'
+      headers:
+        Accept:
+          - '*/*'
+        Accept-Encoding:
+          - gzip, deflate
+        Connection:
+          - keep-alive
+        Content-Length:
+          - '80'
+        Content-Type:
+          - application/json
+        GGShield-HMSL-Command-Name:
+          - cli_hmsl_query
+        User-Agent:
+          - GGShield 1.21.0
+      method: POST
+      uri: https://api.hasmysecretleaked.com/v1/hashes
+    response:
+      body:
+        string: '{"secrets":[{"hash":"743d9fde380b7064cc6a8d3071184fc47905cf7440e5615cd46c7b6cbfb46d47","count":2135,"location":null}]}'
+      headers:
+        content-length:
+          - '118'
+        content-type:
+          - application/json
+        date:
+          - Tue, 28 Nov 2023 09:00:19 GMT
+        ratelimit-limit:
+          - '50'
+        ratelimit-remaining:
+          - '8'
+        ratelimit-reset:
+          - '53980'
+        server:
+          - istio-envoy
+        x-app-version:
+          - 1.9.0
+        x-envoy-upstream-service-time:
+          - '70'
+      status:
+        code: 200
+        message: OK
+version: 1

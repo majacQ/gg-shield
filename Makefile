@@ -1,26 +1,47 @@
 SHELL :=/bin/bash
-.PHONY: all test coverage black flake8
+.PHONY: all test unittest functest coverage black flake8 isort lint lock
 .SILENT:
 
 all:
-	echo "Usage :"
-	echo "      make test"           # Run tests
-	echo "      make coverage"           # Run tests and coverage
-	echo "      make black"          # Run black formatter on python code
-	echo "      make flake8"          # Run flake8 linter on python code
-	echo "      make isort"          # Run isort linter on python code
+	echo "Test targets:"
+	echo "  test                 Run all tests"
+	echo "  unittest             Run unit tests"
+	echo "  coverage             Run unit tests with coverage"
+	echo "  functest             Run functional tests"
+	echo ""
+	echo "Lint targets:"
+	echo "  lint                 Run all lint targets"
+	echo "  black                Run black formatter"
+	echo "  flake8               Run flake8 linter"
+	echo "  isort                Run isort linter"
+	echo ""
+	echo "Other targets:"
+	echo "  lock                 Update pdm.lock"
 
-test:
-	pipenv run pytest --disable-pytest-warnings -vvv $(test)
+test: unittest functest
+
+unittest:
+	pdm run pytest --disable-pytest-warnings -vvv tests/unit
+
+functest:
+	scripts/run-functional-tests
 
 coverage:
-	pipenv run coverage run --source ggshield -m pytest --disable-pytest-warnings && pipenv run coverage report --fail-under=80
+	pdm run coverage run --source ggshield -m pytest --disable-pytest-warnings tests/unit
+	pdm run coverage report --fail-under=80
+	pdm run coverage xml
+	pdm run coverage html
 
 black:
-	pipenv run black .
+	pdm run black .
 
 flake8:
-	pipenv run flake8
+	pdm run flake8
 
 isort:
-	pipenv run isort **/*.py
+	pdm run isort **/*.py
+
+lint: isort black flake8
+
+lock:
+	pdm lock --group :all

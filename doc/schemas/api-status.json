@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ggshield api-status",
+  "type": "object",
+  "properties": {
+    "status_code": {
+      "type": "integer",
+      "minimum": 200,
+      "description": "HTTP status code for the request"
+    },
+    "instance": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL of the GitGuardian instance"
+    },
+    "instance_source": {
+      "enum": ["CMD_OPTION", "DOTENV", "ENV_VAR", "USER_CONFIG", "DEFAULT"],
+      "description": "Source the instance was read from"
+    },
+    "api_key_source": {
+      "enum": ["DOTENV", "ENV_VAR", "USER_CONFIG"],
+      "description": "Source the API key was read from"
+    },
+    "detail": {
+      "type": "string",
+      "description": "Human-readable version of the status"
+    },
+    "app_version": {
+      "type": "string",
+      "description": "Version of the server-side GitGuardian application"
+    },
+    "secrets_engine_version": {
+      "type": "string",
+      "description": "Version of the secrets engine"
+    }
+  },
+  "required": [
+    "status_code",
+    "instance",
+    "detail",
+    "app_version",
+    "secrets_engine_version"
+  ]
+}

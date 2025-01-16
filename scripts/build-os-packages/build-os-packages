@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGNAME=$(basename "$0")
+SCRIPT_DIR=$(cd "$(dirname "$0")" ; pwd)
+ROOT_DIR=$(cd "$SCRIPT_DIR/../.." ; pwd)
+
+DEFAULT_STEPS="req build copy_files test sign create_archive"
+
+PYINSTALLER_OUTPUT_DIR=$ROOT_DIR/dist/ggshield
+PACKAGES_DIR=$ROOT_DIR/packages
+
+REQUIREMENTS="pyinstaller"
+
+# Whether we want a signed binary or not
+DO_SIGN=0
+
+VERSION_SUFFIX=""
+
+# Colors
+C_RED="\e[31;1m"
+C_GREEN="\e[32;1m"
+C_RESET="\e[0m"
+
+err() {
+    echo "$@" >&2
+}
+
+info() {
+    printf "$C_GREEN%s$C_RESET\n" "$PROGNAME: [INFO] $*" >&2
+}
+
+die() {
+    printf "$C_RED%s$C_RESET\n" "$PROGNAME: [ERROR] $*" >&2
+    exit 1
+}
+
+check_var() {
+    local name="$1"
+    set +u
+    if [ -z "${!name}" ] ; then
+        die "\$$name must be set"
+    fi
+    set -u
+}
+
+usage() {
+    if [ "$*" != "" ] ; then
+        err "Error: $*"
+        err
+    fi
+
+    cat << EOF
+Usage: $PROGNAME [OPTION ...] [STEPS]
+Build OS specific packages for ggshield.
+
+Default steps are: $DEFAULT_STEPS
+
+Options:
+  -h, --help      Display this usage message and exit.
+  --sign          Sign the binary, on supported OSes.
+  --suffix SUFFIX Append "SUFFIX" to the version number.
+
+For more details, see doc/dev/os-packages.md.
+EOF
+
+    exit 1
+}
+
+read_version() {
+    VERSION=$(grep -o "[0-9]*\.[0-9]*\.[0-9]*" "$ROOT_DIR/ggshield/__init__.py")
+    if [ -n "$VERSION_SUFFIX" ] ; then
+        VERSION="${VERSION}${VERSION_SUFFIX}"
+    fi
+    info "VERSION=$VERSION"
+}
+
+init_system_vars() {
+    local arch
+    arch=$(uname -m)
+
+    case "$arch" in
+    arm64)
+        HUMAN_ARCH=ARM-based
+        ;;
+    x86_64)
+        HUMAN_ARCH=Intel-based
+        ;;
+    *)
+        die "Unsupported architecture '$arch'"
+        ;;
+    esac
+
+    local out
+    out=$(uname)
+
+    # directory containing ggshield executable, inside the archive
+    INSTALL_PREFIX=""
+
+    case "$out" in
+    Linux)
+        EXE_EXT=""
+        TARGET="$arch-unknown-linux-gnu"
+        HUMAN_OS=Linux
+        REQUIREMENTS="$REQUIREMENTS nfpm"
+        ;;
+    Darwin)
+        EXE_EXT=""
+        HUMAN_OS=macOS
+        TARGET="$arch-apple-darwin"
+        INSTALL_PREFIX=opt/gitguardian/ggshield-$VERSION
+        ;;
+    MINGW*|MSYS*)
+        EXE_EXT=".exe"
+        HUMAN_OS=Windows
+        TARGET="$arch-pc-windows-msvc"
+        ;;
+    *)
+        die "Unknown OS. uname printed '$out'"
+        ;;
+    esac
+    ARCHIVE_DIR_NAME=ggshield-$VERSION-$TARGET
+}
+
+load_os_specific_code() {
+    case "$HUMAN_OS" in
+    macOS)
+        . "$SCRIPT_DIR/macos-functions.bash"
+        ;;
+    Windows)
+        . "$SCRIPT_DIR/windows-functions.bash"
+        ;;
+    *)
+        ;;
+    esac
+}
+
+add_os_specific_sign_requirements() {
+    case "$HUMAN_OS" in
+    macOS)
+        macos_add_sign_dependencies
+        ;;
+    Windows)
+        windows_add_sign_dependencies
+        ;;
+    *)
+        ;;
+    esac
+}
+
+step_req() {
+    local fail=0
+    info "Checking requirements"
+    local requirements=$REQUIREMENTS
+    for exe in $requirements ; do
+        err -n "$exe: "
+        if command -v "$exe" > /dev/null ; then
+            err OK
+        else
+            err FAIL
+            fail=1
+        fi
+    done
+    if [ $fail -ne 0 ] ; then
+        die "Not all requirements are installed"
+    fi
+}
+
+step_build() {
+    rm -rf build/ggshield
+    rm -rf "$PYINSTALLER_OUTPUT_DIR"
+
+    local extra_args=""
+    if [ "$HUMAN_OS" != Windows ] ; then
+        # Only strip on Linux and macOS: pyinstaller docs says it's not
+        # recommended on Windows.
+        extra_args="--strip"
+    fi
+
+    pyinstaller ggshield/__main__.py --name ggshield --noupx $extra_args
+
+    if [ "$HUMAN_OS" != Windows ] ; then
+        # Libraries do not need to be executable
+        find "$PYINSTALLER_OUTPUT_DIR" \( -name "*.so.*" -o -name "*.so" -o -name "*.dylib" \) \
+            -exec chmod -x '{}' ';'
+    fi
+}
+
+step_copy_files() {
+    if ! [ -d "$PYINSTALLER_OUTPUT_DIR" ] ; then
+        die "$PYINSTALLER_OUTPUT_DIR does not exist"
+    fi
+    local pyinstaller_ggshield=$PYINSTALLER_OUTPUT_DIR/ggshield$EXE_EXT
+    if ! [ -f "$pyinstaller_ggshield" ] ; then
+        die "Can't find '$pyinstaller_ggshield', maybe 'build' step did not run?"
+    fi
+
+    mkdir -p "$PACKAGES_DIR"
+    case "$HUMAN_OS" in
+    Linux|Windows)
+        local output_dir="$PACKAGES_DIR/$ARCHIVE_DIR_NAME"
+        info "Copying files to $output_dir"
+        rm -rf "$output_dir"
+        cp -R "$PYINSTALLER_OUTPUT_DIR" "$output_dir"
+
+        info "Generating README.md"
+        sed \
+            -e "s/@HUMAN_OS@/$HUMAN_OS/" \
+            -e "s/@HUMAN_ARCH@/$HUMAN_ARCH/" \
+            "$SCRIPT_DIR/README.md.tmpl" \
+            > "$output_dir/README.md"
+        ;;
+    macOS)
+        local output_dir="$PACKAGES_DIR/$ARCHIVE_DIR_NAME/$INSTALL_PREFIX"
+        local bin_dir="$PACKAGES_DIR/$ARCHIVE_DIR_NAME/usr/local/bin"
+        info "Copying files to $output_dir"
+        rm -rf "$output_dir" "$bin_dir"
+        mkdir -p "$(dirname $output_dir)"
+        cp -R "$PYINSTALLER_OUTPUT_DIR" "$output_dir"
+
+        info "Creating launcher symlink"
+        mkdir -p "$bin_dir"
+        ln -s "/$INSTALL_PREFIX/ggshield" "$bin_dir/ggshield"
+        ;;
+    esac
+}
+
+step_sign() {
+    if [ "$DO_SIGN" -eq 0 ] ; then
+        info "Skipping signing step"
+        return
+    fi
+    case "$HUMAN_OS" in
+    macOS)
+        macos_sign
+        ;;
+    Windows)
+        windows_sign
+        ;;
+    *)
+        info "Signing not supported on $HUMAN_OS, skipping step"
+        ;;
+    esac
+}
+
+step_test() {
+    for args in --help --version ; do
+        info "test: running $args"
+        "$PACKAGES_DIR/$ARCHIVE_DIR_NAME/$INSTALL_PREFIX/ggshield${EXE_EXT}" $args
+        info "test: running $args: OK"
+    done
+}
+
+step_functests() {
+    PATH=$PACKAGES_DIR/$ARCHIVE_DIR_NAME/$INSTALL_PREFIX:$PATH pytest -n auto tests/functional
+}
+
+create_linux_packages() {
+    for format in rpm deb ; do
+        info "Building $format"
+
+        PYINSTALLER_OUTPUT_DIR=$PYINSTALLER_OUTPUT_DIR \
+        VERSION=$VERSION \
+            nfpm package \
+                --packager $format \
+                --config "$SCRIPT_DIR/nfpm.yaml" \
+                --target "$PACKAGES_DIR"
+    done
+}
+
+step_create_archive() {
+    local archive_path
+    case "$HUMAN_OS" in
+    Linux)
+        archive_path="$PACKAGES_DIR/$ARCHIVE_DIR_NAME.tar.gz"
+        pushd "$PACKAGES_DIR"
+        tar -czf "$archive_path" "$ARCHIVE_DIR_NAME"
+        popd
+        create_linux_packages
+        info "Archive created in $archive_path"
+        ;;
+    macOS)
+        # Create pkg file
+        pkg_path="$PACKAGES_DIR/$ARCHIVE_DIR_NAME.pkg"
+        pushd "$PACKAGES_DIR"
+        pkgbuild \
+            --identifier com.gitguardian.ggshield \
+            --version "$VERSION" \
+            --root "$PACKAGES_DIR/$ARCHIVE_DIR_NAME" \
+            "$pkg_path"
+        popd
+
+        if [ "$DO_SIGN" -eq 1 ] ; then
+            macos_sign_file "$pkg_path"
+        fi
+
+        # Create tar.gz
+        archive_path="$PACKAGES_DIR/$ARCHIVE_DIR_NAME.tar.gz"
+
+        # $PACKAGE_DIR/$ARCHIVE_DIR_NAME currently contains the following file tree:
+        #
+        #   $INSTALL_PREFIX
+        #     ggshield
+        #     internal/
+        #   usr/local/bin
+        #     ggshield -> /$INSTALL_PREFIX/ggshield
+        #
+        # We don't want the tar.gz to contain a file tree like this, it must contain a
+        # tree similar to the Linux tar.gz, with a root dir called $ARCHIVE_DIR_NAME
+        # containing what is currently in $INSTALL_PREFIX. To set this up, we move
+        # $INSTALL_PREFIX to a temporary directory and create the tar.gz from there.
+        # (we can't use `tar --transform`: it's not supported on macOS)
+        rm -rf "$PACKAGES_DIR/tmp"
+        mkdir "$PACKAGES_DIR/tmp"
+        pushd "$PACKAGES_DIR/tmp"
+        mv "$PACKAGES_DIR/$ARCHIVE_DIR_NAME/$INSTALL_PREFIX" "$ARCHIVE_DIR_NAME"
+        tar -czf "$archive_path" "$ARCHIVE_DIR_NAME"
+        popd
+
+        info "Archive created in $pkg_path & $archive_path"
+        ;;
+    Windows)
+        archive_path="$PACKAGES_DIR/$ARCHIVE_DIR_NAME.zip"
+        pushd "$PACKAGES_DIR"
+        7z a "$archive_path" "$ARCHIVE_DIR_NAME"
+        popd
+        info "Archive created in $archive_path"
+        ;;
+    esac
+}
+
+steps=""
+while [ $# -gt 0 ] ; do
+    case "$1" in
+    -h|--help)
+        usage
+        ;;
+    --sign)
+        DO_SIGN=1
+        ;;
+    --suffix)
+        VERSION_SUFFIX="$2"
+        shift
+        ;;
+    -*)
+        usage "Unknown option '$1'"
+        ;;
+    *)
+        steps="$steps $1"
+        ;;
+    esac
+    shift
+done
+
+cd "$ROOT_DIR"
+read_version
+init_system_vars
+load_os_specific_code
+if [ "$DO_SIGN" -eq 1 ] ; then
+    add_os_specific_sign_requirements
+fi
+
+if [ -z "$steps" ] ; then
+    steps=$DEFAULT_STEPS
+fi
+info "Steps: $steps"
+
+for step in $steps ; do
+    info "step $step"
+    "step_$step"
+done
+info "Success!"

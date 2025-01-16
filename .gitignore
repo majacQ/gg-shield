@@ -26,6 +26,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+packages/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -87,11 +88,13 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.envrc
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.functestenv/
 
 # Spyder project settings
 .spyderproject
@@ -126,3 +129,7 @@ test-secret-files.json
 
 # cache
 .cache_ggshield
+*.msi
+
+# pdm
+.pdm-python

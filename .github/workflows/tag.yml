@@ -6,63 +6,89 @@ on:
       - 'v*'
 
 jobs:
-  pypi:
-    runs-on: ubuntu-latest
+  build_release_assets:
+    uses: ./.github/workflows/build_release_assets.yml
+    secrets: inherit
+    with:
+      release_mode: true
+
+  push_to_pypi:
+    needs: build_release_assets
+    runs-on: ubuntu-22.04
     if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip setuptools wheel
-      - name: Build distribution
-        run: >-
-          python setup.py sdist bdist_wheel
+
+      - name: Download wheel and sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
       - name: Publish distribution 📦 to PyPI
-        uses: pypa/gh-action-pypi-publish@master
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
           password: ${{ secrets.pypi_password }}
 
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    needs: build_release_assets
+    continue-on-error: true
     if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+
+    # This is required for `gh release create` to work
+    permissions:
+      contents: write
+
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Read info
         id: tags
         shell: bash
         run: |
-          echo ::set-output name=VERSION::${GITHUB_REF/refs\/tags\/v/}
-          echo ::set-output name=TAG::${GITHUB_REF/refs\/tags\//}
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@master
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.tags.outputs.tag }}
-          release_name: ${{ steps.tags.outputs.tag }}
-          draft: false
-          prerelease: false
+          echo "tag=${GITHUB_REF/refs\/tags\//}" >> $GITHUB_OUTPUT
 
-      - name: Release Notary Action
-        uses: docker://aevea/release-notary:0.9.1
+      - name: Download OS packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: os-packages-*
+          path: packages
+          merge-multiple: true
+
+      - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create --draft ${{ steps.tags.outputs.tag }}
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload \
+            ${{ steps.tags.outputs.tag }} \
+            packages/ggshield-*.pkg \
+            packages/ggshield_*.deb \
+            packages/ggshield-*.rpm \
+            packages/ggshield-*.zip \
+            packages/ggshield-*.gz
 
   push_to_docker_hub:
     name: Push Docker image to Docker Hub
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Build and push
         uses: docker/build-push-action@v1
         with:
@@ -70,19 +96,73 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
           repository: gitguardian/ggshield
           tag_with_ref: true
+          tags: latest
 
   push_to_github_packages:
     name: Push Docker image to GitHub Packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Push to GitHub Packages
         uses: docker/build-push-action@v1
         with:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
           registry: docker.pkg.github.com
-          repository: gitguardian/gg-shield/ggshield
+          repository: gitguardian/ggshield/ggshield
           tag_with_ref: true
+          tags: latest
+
+  push_to_tap:
+    needs: push_to_pypi
+    name: Push to GitGuardian taps
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+    steps:
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.9
+
+      - name: Checkout Homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: GitGuardian/homebrew-tap
+          token: ${{ secrets.PAT_GITHUB }}
+
+      - name: Update Homebrew-tap
+        run: |
+          version=${GITHUB_REF/refs\/tags\/v/}
+
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+
+          scripts/update-ggshield --commit "$version"
+
+          git push
+
+  push_to_cloudsmith:
+    needs: build_release_assets
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: os-packages-*
+          path: packages
+          merge-multiple: true
+
+      - name: Install Cloudsmith CLI
+        run: pip install cloudsmith-cli
+
+      - name: Push to Cloudsmith
+        run: |
+          scripts/push-to-cloudsmith
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}

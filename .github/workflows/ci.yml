@@ -1,0 +1,204 @@
+name: CI
+
+# About steps requiring the GITGUARDIAN_API_KEY:
+#
+# For security reasons, secrets are not available when a workflow is triggered by a pull request from a fork. This
+# causes all steps requiring the GITGUARDIAN_API_KEY to fail. To avoid this, we skip those steps when we are triggered
+# by a pull request from a fork.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+    paths-ignore:
+      - 'doc/**'
+      - 'README.md'
+
+env:
+  PDM_VERSION: 2.20.1
+  DEFAULT_PYTHON_VERSION: '3.10'
+
+jobs:
+  lint:
+    name: Lint package
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PDM
+        uses: pdm-project/setup-pdm@v4
+        with:
+          version: ${{ env.PDM_VERSION }}
+          python-version: ${{ env.DEFAULT_PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pdm sync
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit hooks
+        run: pdm run pre-commit install --install-hooks
+
+      - name: Skip ggshield hooks when running from a fork
+        # See note about steps requiring the GITGUARDIAN_API at the top of this file
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          echo "SKIP=ggshield,ggshield-local" >> $GITHUB_ENV
+
+      - name: Run pre-commit checks
+        run: |
+          pdm run pre-commit run --show-diff-on-failure --all-files
+        env:
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+
+      - name: Check commit messages
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_REF="${GITHUB_REF%/merge}/head"
+          git fetch origin "$PR_REF"
+          if git log --format=%s "origin/$GITHUB_BASE_REF..FETCH_HEAD" | grep '^fixup!' ; then
+              echo 'Error: this pull request contains fixup commits. Squash them.'
+              exit 1
+          fi
+          # In case `git log` fails
+          exit "${PIPESTATUS[0]}"
+
+  build:
+    name: Build and Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-13, windows-2022]
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Get enough commits to run `ggshield secret scan commit-range` on ourselves
+          fetch-depth: 10
+
+      - name: Setup PDM & Python ${{ matrix.python-version }}
+        uses: pdm-project/setup-pdm@v4
+        with:
+          version: ${{ env.PDM_VERSION }}
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pdm sync --group dev --group tests
+
+      - name: Override base Docker image used for functional tests on Windows
+        if: matrix.os == 'windows-2022'
+        # This is required because GitHub Windows runner is not configured to
+        # run Linux-based Docker images
+        shell: bash
+        run: |
+          echo "GGTEST_DOCKER_IMAGE=mcr.microsoft.com/windows/nanoserver:ltsc2022" >> $GITHUB_ENV
+
+      - name: Ensure a clean package installation
+        run: |
+          pdm build --no-sdist
+          # The created wheel (.whl) file will be found and analyzed within the `dist/` folder
+          pdm run check-wheel-contents dist/
+
+      - name: Run unit tests
+        run: |
+          pdm run coverage run --source ggshield -m pytest --disable-pytest-warnings --disable-socket tests/unit
+
+      - name: Gather coverage report
+        run: |
+          pdm run coverage report --fail-under=80
+          pdm run coverage xml
+
+      - uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+      - name: Run functional tests
+        # See note about steps requiring the GITGUARDIAN_API at the top of this file
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        shell: bash
+        run: |
+          make functest
+        env:
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+          GITGUARDIAN_API_URL: ${{ secrets.GITGUARDIAN_API_URL }}
+          TEST_KNOWN_SECRET: ${{ secrets.TEST_KNOWN_SECRET }}
+          TEST_GG_VALID_TOKEN: ${{ secrets.TEST_GG_VALID_TOKEN }}
+          TEST_GG_VALID_TOKEN_IGNORE_SHA: ${{ secrets.TEST_GG_VALID_TOKEN_IGNORE_SHA }}
+          TEST_UNKNOWN_SECRET: ${{ secrets.TEST_UNKNOWN_SECRET }}
+
+  build_os_packages:
+    uses: ./.github/workflows/build_release_assets.yml
+    secrets: inherit
+
+  test_github_secret_scan_action:
+    name: Test GitHub action for `secret scan`
+    # See note about steps requiring the GITGUARDIAN_API at the top of this file
+    if: ${{ !github.event.pull_request.head.repo.fork }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan commits for hardcoded secrets
+        uses: ./actions-unstable/secret
+        env:
+          GITHUB_PUSH_BEFORE_SHA: ${{ github.event.before }}
+          GITHUB_PUSH_BASE_SHA: ${{ github.event.base }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+          GITGUARDIAN_API_URL: ${{ secrets.GITGUARDIAN_API_URL }}
+
+  dockerhub-unstable:
+    name: Push Docker image to Docker Hub
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs:
+      - lint
+      - build
+      - test_github_secret_scan_action
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build and push
+        uses: docker/build-push-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: gitguardian/ggshield
+          tags: unstable
+
+  github_packages-unstable:
+    name: Push Docker image to GitHub Packages
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs:
+      - lint
+      - build
+      - test_github_secret_scan_action
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+      - name: Push to GitHub Packages
+        uses: docker/build-push-action@v1
+        with:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: docker.pkg.github.com
+          repository: gitguardian/ggshield/ggshield
+          tags: unstable
